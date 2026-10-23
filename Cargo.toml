@@ -1,0 +1,15 @@
+[package]
+name = "memrium-monitor"
+version = "0.1.0"
+edition = "2021"
+description = "A process list and performance monitor."
+license = "MIT"
+repository = "https://github.com/Supchik22/memrium-monitor"
+
+[[bin]]
+name = "memrium_monitor"
+path = "src/main.rs"
+
+[dependencies]
+chebrium = { git = "https://github.com/Supchik22/chebrium" }
+memrium-de = { git = "https://github.com/Supchik22/memrium" }
