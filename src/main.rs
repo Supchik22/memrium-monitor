@@ -7,7 +7,7 @@ use chebrium::draw::Align;
 use chebrium::input::{Key, KeyMods};
 use chebrium::ui::{inside, Ui};
 use memrium_de::fsops::human_size;
-use memrium_de::sysmon::{self, format_rate, format_uptime, ProcInfo, Sampler, Snapshot};
+use memrium_de::sysmon::{self, format_rate, format_uptime, GpuUse, ProcInfo, Sampler, Snapshot};
 use chebrium::picture::Pic;
 use memrium_de::apps::{self, IconIndex};
 use std::collections::{HashMap, HashSet};
@@ -32,6 +32,53 @@ enum Col {
     Cpu,
     Mem,
     State,
+    Energy,
+    Gpu,
+}
+
+impl Col {
+    fn label(self) -> &'static str {
+        match self {
+            Col::Name => "Name",
+            Col::Pid => "PID",
+            Col::User => "User",
+            Col::Cpu => "CPU",
+            Col::Mem => "Memory",
+            Col::State => "Status",
+            Col::Energy => "Energy",
+            Col::Gpu => "GPU",
+        }
+    }
+}
+
+/// The columns to the right of the name, laid out from the right edge: (column, anchor x, alignment, width) and the room
+/// left for the name. A narrow window drops Status, then User.
+fn layout(w: f32) -> (Vec<(Col, f32, Align, f32)>, f32) {
+    let mut edge = w - 24.0;
+    let mut out = Vec::new();
+    for (col, width, align) in [(Col::State, 80.0, Align::Left), (Col::Mem, 80.0, Align::Right), (Col::Energy, 60.0, Align::Right), (Col::Gpu, 84.0, Align::Left), (Col::Cpu, 56.0, Align::Right), (Col::User, 90.0, Align::Left), (Col::Pid, 52.0, Align::Right)] {
+        if (col == Col::State && w < 980.0) || (col == Col::User && w < 800.0) {
+            continue;
+        }
+        let left = edge - width;
+        out.push((col, if align == Align::Right { edge } else { left }, align, width));
+        edge = left - 12.0;
+    }
+    (out, (edge - 48.0).max(60.0))
+}
+
+/// the amber of the dedicated card, which costs the battery
+const DGPU: [f32; 3] = [0.98, 0.70, 0.20];
+const IGPU: [f32; 3] = [0.30, 0.62, 1.0];
+
+/// "dGPU" / "iGPU 12%": which card a program has open.
+fn gpu_label(p: &ProcInfo) -> Option<String> {
+    match p.gpu {
+        GpuUse::None => None,
+        GpuUse::Dedicated => Some("dGPU".into()),
+        GpuUse::Integrated if p.gpu_busy >= 1.0 => Some(format!("iGPU {:.0}%", p.gpu_busy.min(100.0))),
+        GpuUse::Integrated => Some("iGPU".into()),
+    }
 }
 
 /// What the reading thread sends: the look at the system, and the icons of programs it has not met before.
@@ -102,6 +149,10 @@ struct Monitor {
     mem_hist: Vec<f32>,
     rx_hist: Vec<f32>,
     tx_hist: Vec<f32>,
+    temp_hist: Vec<f32>,
+    /// watts the battery gave, and whether the dedicated card was awake (100) or asleep (0), a reading a second
+    watt_hist: Vec<f32>,
+    dgpu_hist: Vec<f32>,
     dirty: bool,
     /// rows (top, bottom) to bring into view on the next frame
     reveal: Option<(f32, f32)>,
@@ -116,7 +167,7 @@ fn push(hist: &mut Vec<f32>, v: f32) {
 
 impl Monitor {
     fn new() -> Monitor {
-        Monitor { rx: None, icons: HashMap::new(), snap: Snapshot::default(), view: Vec::new(), tab: 0, sort: Col::Cpu, desc: true, filter: String::new(), sel: None, scroll: 0.0, note: String::new(), cpu_hist: Vec::new(), mem_hist: Vec::new(), rx_hist: Vec::new(), tx_hist: Vec::new(), dirty: true, reveal: None }
+        Monitor { rx: None, icons: HashMap::new(), snap: Snapshot::default(), view: Vec::new(), tab: 0, sort: Col::Cpu, desc: true, filter: String::new(), sel: None, scroll: 0.0, note: String::new(), cpu_hist: Vec::new(), mem_hist: Vec::new(), rx_hist: Vec::new(), tx_hist: Vec::new(), temp_hist: Vec::new(), watt_hist: Vec::new(), dgpu_hist: Vec::new(), dirty: true, reveal: None }
     }
 
     fn rebuild(&mut self) {
@@ -133,6 +184,8 @@ impl Monitor {
                 Col::Cpu => x.cpu.total_cmp(&y.cpu),
                 Col::Mem => x.mem.cmp(&y.mem),
                 Col::State => x.state_name().cmp(y.state_name()),
+                Col::Energy => x.energy.total_cmp(&y.energy),
+                Col::Gpu => (x.gpu as u8, x.gpu_busy).partial_cmp(&(y.gpu as u8, y.gpu_busy)).unwrap_or(std::cmp::Ordering::Equal),
             };
             let o = if desc { o.reverse() } else { o };
             o.then(x.pid.cmp(&y.pid))
@@ -155,6 +208,9 @@ impl Monitor {
             push(&mut self.mem_hist, if s.mem.total > 0 { 100.0 * s.mem.used() as f32 / s.mem.total as f32 } else { 0.0 });
             push(&mut self.rx_hist, s.rx as f32);
             push(&mut self.tx_hist, s.tx as f32);
+            push(&mut self.temp_hist, s.temps.first().map_or(0.0, |t| t.celsius));
+            push(&mut self.watt_hist, s.battery.as_ref().map_or(0.0, |b| b.watts));
+            push(&mut self.dgpu_hist, if s.gpus.iter().any(|g| !g.integrated && g.power.as_deref() == Some("active")) { 100.0 } else { 0.0 });
             self.snap = s;
             self.dirty = true;
             got = true;
@@ -296,9 +352,7 @@ impl Monitor {
         let [w, h] = size;
         let (ink, accent) = (ui.ink, ui.accent);
         let list = [0.0, TOP_H + HEAD_H, w, (h - TOP_H - HEAD_H - BAR_H).max(ROW_H)];
-        // columns from the right edge: status, memory, cpu, user, pid; the name takes the rest
-        let (x_state, x_mem, x_cpu, x_user, x_pid) = (w - 24.0 - 80.0, w - 24.0 - 90.0 - 80.0 - 12.0, w - 24.0 - 90.0 - 80.0 - 12.0 - 80.0 - 4.0, w - 24.0 - 90.0 - 80.0 - 12.0 - 80.0 - 4.0 - 110.0, w - 24.0 - 90.0 - 80.0 - 12.0 - 80.0 - 4.0 - 110.0 - 70.0);
-        let name_max = (x_pid - 60.0).max(60.0);
+        let (cols, name_max) = layout(w);
 
         // scroll
         let n = self.view.len();
@@ -340,14 +394,34 @@ impl Monitor {
             }
             let name = fit(ui, &p.name, 13.0, false, name_max - 30.0);
             ui.text_raw(r[0] + 40.0, cy, &name, 13.0, false, ink, 0.95, Align::Left);
-            ui.text_raw(x_pid + 60.0, cy, &p.pid.to_string(), 12.5, false, ink, 0.6, Align::Right);
-            let user = fit(ui, &p.user, 12.5, false, 100.0);
-            ui.text_raw(x_user + 10.0, cy, &user, 12.5, false, ink, 0.7, Align::Left);
-            // the processor share is shaded by how much it is
-            let hot = (p.cpu / 100.0).clamp(0.0, 1.0);
-            ui.text_raw(x_cpu + 70.0, cy, &format!("{:.1}%", p.cpu), 12.5, p.cpu >= 25.0, ink, 0.55 + 0.4 * hot, Align::Right);
-            ui.text_raw(x_mem + 80.0, cy, &human_size(p.mem), 12.5, false, ink, 0.8, Align::Right);
-            ui.text_raw(x_state + 8.0, cy, p.state_name(), 12.0, false, ink, if p.state == 'Z' { 0.9 } else { 0.55 }, Align::Left);
+            for &(col, x, align, width) in &cols {
+                match col {
+                    Col::Pid => ui.text_raw(x, cy, &p.pid.to_string(), 12.5, false, ink, 0.6, align),
+                    Col::User => {
+                        let user = fit(ui, &p.user, 12.5, false, width);
+                        ui.text_raw(x, cy, &user, 12.5, false, ink, 0.7, align);
+                    }
+                    // the processor share is shaded by how much it is
+                    Col::Cpu => ui.text_raw(x, cy, &format!("{:.1}%", p.cpu), 12.5, p.cpu >= 25.0, ink, 0.55 + 0.4 * (p.cpu / 100.0).clamp(0.0, 1.0), align),
+                    Col::Energy => {
+                        let hot = p.energy >= 25.0;
+                        ui.text_raw(x, cy, &format!("{:.1}", p.energy), 12.5, hot, if p.energy >= 50.0 { DGPU } else { ink }, 0.55 + 0.4 * (p.energy / 50.0).clamp(0.0, 1.0), align);
+                    }
+                    Col::Gpu => {
+                        if let Some(label) = gpu_label(&p) {
+                            let (colour, on) = if p.gpu == GpuUse::Dedicated { (DGPU, true) } else { (IGPU, false) };
+                            let tw = ui.measure_raw(&label, 11.5, on);
+                            if on {
+                                ui.fill([x - 6.0, cy - 12.5, tw + 12.0, 18.0], 9.0, colour, 0.25);
+                            }
+                            ui.text_raw(x, cy, &label, 11.5, on, if on { colour } else { ink }, if on { 1.0 } else { 0.6 }, align);
+                        }
+                    }
+                    Col::Mem => ui.text_raw(x, cy, &human_size(p.mem), 12.5, false, ink, 0.8, align),
+                    Col::State => ui.text_raw(x, cy, p.state_name(), 12.0, false, ink, if p.state == 'Z' { 0.9 } else { 0.55 }, align),
+                    Col::Name => {}
+                }
+            }
             if ui.click && hov {
                 clicked_row = true;
                 self.sel = if selected && ui.double { None } else { Some(p.pid) };
@@ -366,7 +440,10 @@ impl Monitor {
         ui.fill([0.0, TOP_H, w, HEAD_H], 0.0, [1.0, 1.0, 1.0], 0.0);
         ui.fill([8.0, TOP_H + HEAD_H - 1.0, w - 16.0, 1.0], 0.0, ink, 0.10);
         let mut sort_to = None;
-        for (label, col, x, align, width) in [("Name", Col::Name, 48.0, Align::Left, 80.0), ("PID", Col::Pid, x_pid + 60.0, Align::Right, 40.0), ("User", Col::User, x_user + 10.0, Align::Left, 60.0), ("CPU", Col::Cpu, x_cpu + 70.0, Align::Right, 50.0), ("Memory", Col::Mem, x_mem + 80.0, Align::Right, 60.0), ("Status", Col::State, x_state + 8.0, Align::Left, 60.0)] {
+        let mut heads = vec![(Col::Name, 48.0, Align::Left, 80.0)];
+        heads.extend(cols.iter().map(|&(c, x, a, wd)| (c, x, a, wd)));
+        for (col, x, align, width) in heads {
+            let label = col.label();
             let rx = if align == Align::Right { x - width } else { x };
             let hov = ui.hit([rx - 4.0, TOP_H, width + 8.0, HEAD_H]);
             let on = self.sort == col;
@@ -384,7 +461,7 @@ impl Monitor {
                 self.desc = !self.desc;
             } else {
                 self.sort = c;
-                self.desc = matches!(c, Col::Cpu | Col::Mem);
+                self.desc = matches!(c, Col::Cpu | Col::Mem | Col::Energy | Col::Gpu);
             }
             self.dirty = true;
         }
@@ -432,7 +509,7 @@ impl Monitor {
         let cw = (w - pad * (cols + 1.0)) / cols;
         let top = TOP_H + pad;
         let avail = h - top - pad;
-        let rows = if cols > 1.0 { 2.0 } else { 3.0 };
+        let rows = if cols > 1.0 { 3.0 } else { 5.0 };
         let ch = ((avail - pad * (rows - 1.0)) / rows).max(120.0);
         let card = |i: usize| -> [f32; 4] {
             let (c, r) = if cols > 1.0 { (i as f32 % 2.0, (i / 2) as f32) } else { (0.0, i as f32) };
@@ -474,20 +551,125 @@ impl Monitor {
         graph(ui, area, &self.tx_hist, peak, [0.95, 0.60, 0.20]);
         ui.text_raw(nw[0] + 16.0, nw[1] + nw[3] - 10.0, &format!("Scale {}", format_rate(peak as f64)), 11.5, false, ink, 0.5, Align::Left);
 
-        // the busiest processes
-        if cols > 1.0 {
-            let t = card(3);
-            self.card(ui, t, "Busiest", "");
-            let mut top: Vec<&ProcInfo> = self.snap.procs.iter().collect();
-            top.sort_by(|a, b| b.cpu.total_cmp(&a.cpu));
-            for (i, p) in top.iter().take(((t[3] - 62.0) / 24.0).max(1.0) as usize).enumerate() {
-                let y = t[1] + 74.0 + i as f32 * 24.0;
-                let name = fit(ui, &p.name, 12.5, false, t[2] - 160.0);
-                ui.text_raw(t[0] + 16.0, y, &name, 12.5, false, ink, 0.9, Align::Left);
-                ui.text_raw(t[0] + t[2] - 16.0 - 90.0, y, &format!("{:.1}%", p.cpu), 12.5, false, ink, 0.8, Align::Right);
-                ui.text_raw(t[0] + t[2] - 16.0, y, &human_size(p.mem), 12.5, false, ink, 0.6, Align::Right);
+        // temperatures
+        let tc = card(3);
+        let hottest = self.snap.temps.first().map_or(String::new(), |t| format!("{} {:.0} °C", t.name, t.celsius));
+        self.card(ui, tc, "Temperatures", &hottest);
+        if self.snap.temps.is_empty() {
+            ui.text(tc[0] + tc[2] / 2.0, tc[1] + tc[3] / 2.0 + 14.0, "No temperature sensors found", 12.5, false, ink, 0.45, Align::Center);
+        } else {
+            // a tall card also gets the history of the first sensor
+            let mut y0 = tc[1] + 58.0;
+            if tc[3] >= 250.0 {
+                let gh = (tc[3] * 0.32).clamp(50.0, 90.0);
+                graph(ui, [tc[0] + 16.0, y0, tc[2] - 32.0, gh], &self.temp_hist, 100.0, heat(self.snap.temps[0].celsius));
+                y0 += gh + 12.0;
+            }
+            let row_h = 24.0;
+            let ncol = if tc[2] >= 400.0 { 2 } else { 1 };
+            let per_col = (((tc[1] + tc[3] - 22.0 - y0) / row_h) as usize).max(1);
+            let colw = (tc[2] - 32.0 - 20.0 * (ncol - 1) as f32) / ncol as f32;
+            let shown = (per_col * ncol).min(self.snap.temps.len());
+            let (name_w, val_w) = ((colw * 0.42).clamp(70.0, 150.0), 44.0);
+            for (i, t) in self.snap.temps.iter().take(shown).enumerate() {
+                let (c, r) = (i / per_col, i % per_col);
+                let x = tc[0] + 16.0 + c as f32 * (colw + 20.0);
+                let y = y0 + r as f32 * row_h;
+                let name = fit(ui, &t.name, 12.0, false, name_w);
+                ui.text_raw(x, y + 14.5, &name, 12.0, false, ink, 0.8, Align::Left);
+                // the bar runs from 20 to 100 °C and takes the colour of the heat
+                let track = [x + name_w + 8.0, y + 8.0, (colw - name_w - val_w - 16.0).max(20.0), 6.0];
+                ui.fill(track, 3.0, ink, 0.10);
+                let frac = ((t.celsius - 20.0) / 80.0).clamp(0.0, 1.0);
+                ui.fill([track[0], track[1], (track[2] * frac).max(6.0), track[3]], 3.0, heat(t.celsius), 0.95);
+                let hot = t.celsius >= 70.0;
+                ui.text_raw(x + colw, y + 14.5, &format!("{:.0} °C", t.celsius), 12.0, hot, if hot { heat(t.celsius) } else { ink }, if hot { 1.0 } else { 0.85 }, Align::Right);
+            }
+            if shown < self.snap.temps.len() {
+                ui.text_raw(tc[0] + tc[2] - 16.0, tc[1] + tc[3] - 6.0, &format!("+{} more", self.snap.temps.len() - shown), 10.5, false, ink, 0.45, Align::Right);
             }
         }
+
+        // power: what the battery gives, and whether the dedicated card is awake
+        let pc = card(4);
+        self.power_card(ui, pc);
+
+        // who costs the most energy
+        if cols > 1.0 {
+            let t = card(5);
+            self.card(ui, t, "Energy impact", "");
+            let mut top: Vec<&ProcInfo> = self.snap.procs.iter().filter(|p| p.energy >= 0.05).collect();
+            top.sort_by(|a, b| b.energy.total_cmp(&a.energy));
+            let rows = (((t[3] - 62.0) / 24.0).max(1.0) as usize).min(top.len());
+            for (i, p) in top.iter().take(rows).enumerate() {
+                let y = t[1] + 74.0 + i as f32 * 24.0;
+                let name = fit(ui, &p.name, 12.5, false, t[2] - 220.0);
+                ui.text_raw(t[0] + 16.0, y, &name, 12.5, false, ink, 0.9, Align::Left);
+                if let Some(label) = gpu_label(p) {
+                    let (colour, on) = if p.gpu == GpuUse::Dedicated { (DGPU, true) } else { (IGPU, false) };
+                    ui.text_raw(t[0] + t[2] - 16.0 - 80.0, y, &label, 11.5, on, if on { colour } else { ink }, if on { 1.0 } else { 0.6 }, Align::Right);
+                }
+                ui.text_raw(t[0] + t[2] - 16.0, y, &format!("{:.1}", p.energy), 12.5, p.energy >= 25.0, ink, 0.55 + 0.4 * (p.energy / 50.0).clamp(0.0, 1.0), Align::Right);
+            }
+            if top.is_empty() {
+                ui.text(t[0] + t[2] / 2.0, t[1] + t[3] / 2.0 + 14.0, "Nothing is using energy", 12.5, false, ink, 0.45, Align::Center);
+            }
+        }
+    }
+
+    /// The battery's draw over the last minute, a strip that is amber while the dedicated card is awake, and who keeps it so.
+    fn power_card(&self, ui: &mut Ui<'_>, r: [f32; 4]) {
+        let ink = ui.ink;
+        let value = match &self.snap.battery {
+            Some(b) if b.discharging() && b.watts > 0.05 => format!("{:.1} W · {}%", b.watts, b.percent),
+            Some(b) => format!("{} · {}%", b.status, b.percent),
+            None => "No battery".to_string(),
+        };
+        self.card(ui, r, "Power", &value);
+        let strip_h = 10.0;
+        let line_h = 20.0;
+        let hybrid = memrium_de::gpu::hybrid(&self.snap.gpus);
+        let below = if hybrid { strip_h + 10.0 + 2.0 * line_h } else { 8.0 };
+        let area = [r[0] + 16.0, r[1] + 58.0, r[2] - 32.0, (r[3] - 58.0 - below - 8.0).max(24.0)];
+        let peak = self.watt_hist.iter().copied().fold(15.0f32, f32::max);
+        graph(ui, area, &self.watt_hist, peak, [0.98, 0.45, 0.35]);
+        ui.text_raw(area[0] + 6.0, area[1] + 13.0, &format!("{} W", peak.round()), 10.5, false, ink, 0.4, Align::Left);
+        if !hybrid {
+            return;
+        }
+        // the dedicated card: awake (amber) or asleep, a second a pixel column
+        let strip = [area[0], area[1] + area[3] + 8.0, area[2], strip_h];
+        ui.fill(strip, 3.0, ink, 0.08);
+        let bw = strip[2] / HISTORY as f32;
+        let shift = HISTORY - self.dgpu_hist.len();
+        ui.push_clip(strip);
+        for (i, v) in self.dgpu_hist.iter().enumerate() {
+            if *v > 0.0 {
+                ui.fill([strip[0] + (shift + i) as f32 * bw, strip[1], bw + 0.5, strip[3]], 0.0, DGPU, 0.9);
+            }
+        }
+        ui.pop_clip();
+        let dgpu = self.snap.gpus.iter().find(|g| !g.integrated);
+        let awake = dgpu.is_some_and(|g| g.power.as_deref() == Some("active"));
+        let share = if self.dgpu_hist.is_empty() { 0.0 } else { self.dgpu_hist.iter().filter(|v| **v > 0.0).count() as f32 / self.dgpu_hist.len() as f32 };
+        let name = dgpu.map_or("Dedicated GPU", |g| g.name.as_str());
+        let state = if awake { "awake" } else { "asleep" };
+        let y1 = strip[1] + strip_h + 16.0;
+        let head = fit(ui, &format!("{name}: {state}"), 12.0, awake, r[2] - 32.0 - 90.0);
+        ui.text_raw(strip[0], y1, &head, 12.0, awake, if awake { DGPU } else { ink }, if awake { 1.0 } else { 0.75 }, Align::Left);
+        ui.text_raw(strip[0] + strip[2], y1, &format!("awake {:.0}% of the minute", share * 100.0), 11.5, false, ink, 0.55, Align::Right);
+        // the programs holding it open
+        let mut holders: Vec<&ProcInfo> = self.snap.procs.iter().filter(|p| p.gpu == GpuUse::Dedicated).collect();
+        holders.sort_by(|a, b| b.cpu.total_cmp(&a.cpu).then(a.pid.cmp(&b.pid)));
+        let mut names: Vec<&str> = Vec::new();
+        for p in &holders {
+            if !names.contains(&p.name.as_str()) {
+                names.push(&p.name);
+            }
+        }
+        let used = if names.is_empty() { "No program uses it".to_string() } else { format!("Used by {}", names.join(", ")) };
+        let used = fit(ui, &used, 11.5, false, strip[2]);
+        ui.text_raw(strip[0], y1 + line_h, &used, 11.5, false, ink, 0.6, Align::Left);
     }
 
     fn card(&self, ui: &mut Ui<'_>, r: [f32; 4], title: &str, value: &str) {
@@ -498,12 +680,31 @@ impl Monitor {
             "Processor" => "gauge",
             "Memory" => "layers",
             "Network" => "wifi",
+            "Temperatures" => "flame",
+            "Power" => "zap",
+            "Energy impact" => "gauge",
             _ => "list",
         };
         ui.glyph(r[0] + 26.0, r[1] + 24.0, 16.0, icon, accent, 1.0);
         ui.text(r[0] + 42.0, r[1] + 28.0, title, 13.0, true, ink, 0.9, Align::Left);
         ui.text_raw(r[0] + r[2] - 16.0, r[1] + 28.0, value, 13.0, false, ink, 0.75, Align::Right);
     }
+}
+
+/// The colour of a temperature: cool blue, then green, amber and red as it climbs.
+fn heat(c: f32) -> [f32; 3] {
+    const STOPS: [(f32, [f32; 3]); 4] = [(30.0, [0.30, 0.62, 1.0]), (55.0, [0.35, 0.78, 0.45]), (75.0, [0.98, 0.70, 0.20]), (92.0, [1.0, 0.32, 0.28])];
+    if c <= STOPS[0].0 {
+        return STOPS[0].1;
+    }
+    for w in STOPS.windows(2) {
+        let ((t0, a), (t1, b)) = (w[0], w[1]);
+        if c <= t1 {
+            let f = (c - t0) / (t1 - t0);
+            return [a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f];
+        }
+    }
+    STOPS[3].1
 }
 
 /// An area graph of the last readings (`top` is the value at the upper edge), one thin bar a reading.
